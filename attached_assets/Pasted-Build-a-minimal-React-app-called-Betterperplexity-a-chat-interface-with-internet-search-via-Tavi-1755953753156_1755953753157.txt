@@ -1,0 +1,293 @@
+Build a minimal React app called "Betterperplexity" - a chat interface with internet search via Tavily API. User queries trigger parallel searches, display provenance cards, and export research bundles.
+Core Requirements
+
+Next.js 14 + TypeScript React app
+Parallel Tavily searches (general/basic + news/advanced)
+Chat-like UX showing AI answer + source cards
+Export PNG "Research Card" + ZIP "Research Bundle"
+Simple, fail-proof implementation
+
+Stack & Dependencies
+json{
+  "name": "betterperplexity",
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.3.1", 
+    "react-dom": "18.3.1",
+    "dompurify": "3.0.9",
+    "jszip": "3.10.1",
+    "file-saver": "2.0.5",
+    "html-to-image": "1.11.11"
+  },
+  "devDependencies": {
+    "typescript": "5.6.2",
+    "@types/node": "20.12.13",
+    "@types/react": "18.3.3",
+    "@types/file-saver": "2.0.7",
+    "@types/dompurify": "3.0.5"
+  }
+}
+File Structure & Implementation
+Environment
+Create .env.local:
+TAVILY_API_KEY=tvly_your_key_here
+API Helper (app/api/tavily.ts)
+typescriptconst BASE = "https://api.tavily.com";
+export function auth() {
+  const key = process.env.TAVILY_API_KEY;
+  if (!key) throw new Error("Missing TAVILY_API_KEY");
+  return { "Content-Type": "application/json", Authorization: `Bearer ${key}` };
+}
+export async function tvly(path: string, body: any) {
+  const r = await fetch(`${BASE}${path}`, { method: "POST", headers: auth(), body: JSON.stringify(body) });
+  if (!r.ok) return { error: `${path} ${r.status}` };
+  return r.json();
+}
+Search API (app/api/search/route.ts)
+typescriptimport { NextRequest } from "next/server";
+import { tvly } from "../tavily";
+
+export async function POST(req: NextRequest) {
+  const { query } = await req.json();
+  if (!query) return Response.json({ error: "query required" }, { status: 400 });
+
+  // Parallel searches: general/basic + news/advanced
+  const [A, B] = await Promise.all([
+    tvly("/search", { query, topic: "general", search_depth: "basic", include_answer: true, max_results: 8 }),
+    tvly("/search", { query, topic: "news", search_depth: "advanced", include_answer: true, max_results: 8 })
+  ]);
+
+  // Merge and dedupe results by normalized URL
+  const bag = new Map();
+  [A, B].forEach((res, idx) => {
+    res?.results?.forEach(item => {
+      try {
+        const u = new URL(item.url);
+        const key = u.origin + u.pathname;
+        if (!bag.has(key) || (item.score ?? 0) > (bag.get(key).score ?? 0)) {
+          bag.set(key, { ...item, source: idx ? "news" : "general" });
+        }
+      } catch {}
+    });
+  });
+
+  const results = Array.from(bag.values()).sort((x, y) => (y.score ?? 0) - (x.score ?? 0));
+  const answer = A?.answer || B?.answer || "No answer available";
+
+  return Response.json({ query, answer, results });
+}
+Extract API (app/api/extract/route.ts)
+typescriptimport { NextRequest } from "next/server";
+import { tvly } from "../tavily";
+
+export async function POST(req: NextRequest) {
+  const { urls } = await req.json();
+  if (!Array.isArray(urls)) return Response.json({ error: "urls required" }, { status: 400 });
+  
+  const out = await tvly("/extract", { urls, extract_depth: "basic" });
+  return Response.json(out);
+}
+Main UI (app/page.tsx)
+typescript"use client";
+import { useRef, useState } from "react";
+import * as htmlToImage from "html-to-image";
+import { saveAs } from "file-saver";
+import JSZip from "jszip";
+import DOMPurify from "dompurify";
+
+type Card = { title: string; url: string; content?: string; score?: number; favicon?: string; source?: string };
+
+export default function Page() {
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [cards, setCards] = useState<Card[]>([]);
+  const [answer, setAnswer] = useState("");
+  const [error, setError] = useState("");
+  const cardRef = useRef<HTMLDivElement>(null);
+
+  const host = (url: string) => { try { return new URL(url).hostname; } catch { return url; } };
+
+  async function search() {
+    if (!query.trim()) return;
+    setLoading(true); setError("");
+    
+    try {
+      const res = await fetch("/api/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query })
+      });
+      const data = await res.json();
+      
+      if (!res.ok) throw new Error(data.error);
+      
+      setCards(data.results || []);
+      setAnswer(data.answer || "");
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function exportPNG() {
+    if (!cardRef.current) return;
+    const dataUrl = await htmlToImage.toPng(cardRef.current, { cacheBust: true });
+    const blob = await (await fetch(dataUrl)).blob();
+    saveAs(blob, `research-card-${Date.now()}.png`);
+  }
+
+  async function exportZIP() {
+    // Get extracts for top 6 results
+    const urls = cards.slice(0, 6).map(c => c.url);
+    let extracts: any = { results: [] };
+    
+    if (urls.length > 0) {
+      try {
+        const res = await fetch("/api/extract", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ urls })
+        });
+        extracts = await res.json();
+      } catch {}
+    }
+
+    const zip = new JSZip();
+    
+    // Add search results
+    zip.file("results.json", JSON.stringify({
+      query,
+      timestamp: new Date().toISOString(),
+      answer,
+      results: cards
+    }, null, 2));
+
+    // Add extracted content
+    extracts.results?.forEach((item: any, idx: number) => {
+      const clean = DOMPurify.sanitize(item.raw_content || "", { ALLOWED_TAGS: [] });
+      zip.file(`extracts/${idx + 1}-${host(item.url)}.txt`, clean);
+    });
+
+    // Add research card PNG
+    try {
+      if (cardRef.current) {
+        const dataUrl = await htmlToImage.toPng(cardRef.current, { cacheBust: true });
+        const png = await (await fetch(dataUrl)).blob();
+        zip.file("research-card.png", png);
+      }
+    } catch {}
+
+    const blob = await zip.generateAsync({ type: "blob" });
+    saveAs(blob, `research-bundle-${Date.now()}.zip`);
+  }
+
+  return (
+    <div style={{ maxWidth: 960, margin: "0 auto", padding: 16, fontFamily: "system-ui" }}>
+      <h1>Betterperplexity</h1>
+      
+      {/* Search Input */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && search()}
+          placeholder="Ask anything..."
+          style={{ flex: 1, padding: 12, fontSize: 16, border: "1px solid #ddd", borderRadius: 8 }}
+        />
+        <button 
+          onClick={search}
+          disabled={loading || !query.trim()}
+          style={{ padding: "12px 16px", borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" }}
+        >
+          {loading ? "Searching..." : "Search"}
+        </button>
+      </div>
+
+      {error && <div style={{ color: "red", marginBottom: 16 }}>{error}</div>}
+
+      {/* Research Card (Exportable) */}
+      {answer && (
+        <div ref={cardRef} style={{ border: "1px solid #eee", borderRadius: 12, padding: 16, marginBottom: 16, backgroundColor: "white" }}>
+          <div style={{ fontWeight: 600, marginBottom: 8 }}>Answer</div>
+          <div style={{ marginBottom: 16, lineHeight: 1.5 }}>{answer}</div>
+          
+          <div style={{ fontWeight: 600, marginBottom: 8 }}>Top Sources</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 12 }}>
+            {cards.slice(0, 3).map((card) => (
+              <a key={card.url} href={card.url} target="_blank" style={{ textDecoration: "none", color: "inherit" }}>
+                <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 12, height: 120, overflow: "hidden" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                    {card.favicon && <img src={card.favicon} width={16} height={16} alt="" />}
+                    <div style={{ fontWeight: 600, fontSize: 14, lineHeight: "18px" }}>{card.title}</div>
+                  </div>
+                  <div style={{ fontSize: 12, color: "#666", marginBottom: 4 }}>{host(card.url)}</div>
+                  <div style={{ fontSize: 12, color: "#333" }}>{(card.content || "").slice(0, 150)}...</div>
+                </div>
+              </a>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Export Buttons */}
+      {cards.length > 0 && (
+        <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+          <button onClick={exportPNG} style={{ padding: "8px 16px", borderRadius: 8, border: "1px solid #ddd" }}>
+            Export Research Card (PNG)
+          </button>
+          <button onClick={exportZIP} style={{ padding: "8px 16px", borderRadius: 8, border: "1px solid #ddd" }}>
+            Export Research Bundle (ZIP)
+          </button>
+        </div>
+      )}
+
+      {/* All Results */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(400px, 1fr))", gap: 16 }}>
+        {cards.map((card) => (
+          <div key={card.url} style={{ border: "1px solid #eee", borderRadius: 12, padding: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              {card.favicon && <img src={card.favicon} width={20} height={20} alt="" />}
+              <a href={card.url} target="_blank" style={{ fontWeight: 600, color: "#0066cc", textDecoration: "none" }}>
+                {card.title}
+              </a>
+              <span style={{ marginLeft: "auto", fontSize: 12, color: "#666", textTransform: "uppercase" }}>
+                {card.source}
+              </span>
+            </div>
+            <div style={{ fontSize: 12, color: "#666", marginBottom: 8 }}>{host(card.url)}</div>
+            <div style={{ fontSize: 14, lineHeight: 1.4 }}>{(card.content || "").slice(0, 300)}...</div>
+            <div style={{ marginTop: 8, fontSize: 12, color: "#999" }}>Score: {card.score?.toFixed(2) || "N/A"}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+Layout (app/layout.tsx)
+typescriptexport const metadata = { title: "Betterperplexity" };
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body style={{ margin: 0, fontFamily: "system-ui, sans-serif" }}>
+        {children}
+      </body>
+    </html>
+  );
+}
+Key Optimizations Made
+
+Simplified error handling - Basic try/catch with user feedback
+Efficient deduplication - URL normalization prevents duplicates
+Smart resource usage - Extract only top 6 results to stay within free tier
+Fail-safe exports - Continue even if PNG generation fails
+Clean UI - Responsive grid layout with proper source attribution
+Performance - Parallel API calls, minimal re-renders
+
+Tavily Free Tier Strategy
+
+Uses basic search depth where possible (1 credit vs 2)
+Limits extract calls to top 6 results
+Parallel searches maximize result quality within budget
+Falls back gracefully on API errors
