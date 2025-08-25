@@ -1,7 +1,8 @@
 # Overview
 
 Betterperplexity is a React-based search application that provides a chat-like interface for internet searches using the Tavily API. The application performs parallel searches across general and news sources, generates AI-powered answers with source citations, and allows users to export research as PNG cards or ZIP bundles. Built as a full-stack application with Express backend and React frontend using modern web technologies.
-#NOT COMPLETED!
+
+##NOT COMPLETED!
 WHY?:  Money! API credits cost a bunch. Infernece LLM Api is additional cost and implementation that I dont feel worth completed. Thought/Concept are all here.
 # User Preferences
 
